@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Тестовое задание - симуляция ткани</title>
+    <style>
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      div {
+        position: absolute;
+        top: 60 px;
+        left: 60 px;
+        background-color: white;
+        border-radius: 5px;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div> <input type="checkbox" id="gravity"/> Гравитация </div>
+	
+    <canvas id="canvas-container"></canvas>
+
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.4.0/gl-matrix.js"></script>
+    <script>
+const init = async () => {
+	// поддерживает ли браузер WebGPU
+	if (!navigator.gpu) {
+		console.error(
+			"WebGPU cannot be initialized - navigator.gpu not found"
+		);
+		return null;
+	}
+
+	const adapter = await navigator.gpu.requestAdapter();
+	// поддерживает ли видеокарта WebGPU
+	if (!adapter) {
+		console.error("WebGPU cannot be initialized - Adapter not found");
+		// достаточно ли браузер доверяет странице для использования WebGPU
+		if (!window.isSecureContext) {
+			console.error("not secured context");
+		}
+		return null;
+	}
+
+	const device = await adapter.requestDevice();
+	device.lost.then(() => {
+		console.error("WebGPU cannot be initialized - Device has been lost");
+		return null;
+	});
+
+	const canvas = document.getElementById("canvas-container");
+	const context = canvas.getContext("webgpu");
+	if (!context) {
+		console.error(
+			"WebGPU cannot be initialized - Canvas does not support WebGPU"
+		);
+		return null;
+	}
+
+	// настраиваем фреймбуфер
+	const devicePixelRatio = window.devicePixelRatio || 1;
+	canvas.height = canvas.clientHeight * devicePixelRatio;
+	canvas.width = canvas.clientWidth * devicePixelRatio;
+
+	const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+
+	context.configure({
+		device,
+		format: presentationFormat,
+	});
+
+	// Заполнем массив вершин в формате
+	// pos (vec3<f32>) X Y Z *
+	// prevPos (vec3<f32>) X Y Z *
+	// shift (vec3<f32>) X Y Z
+	// rWeight (f32) W
+	// vel (vec3<f32>) vx vy vz *
+	// color(vec4<f32>) R G B A
+
+	const pointsCount = 50; // разбиваем поверхность на столько частей - 1
+	const vertexStructSize = 20; //число параметров в структуре
+	const density = 0.15; // кг/м2
+	const rWeight = ((pointsCount - 1) * (pointsCount - 1)) / density; // 1 / вес точки
+	const movePointIndex = (pointsCount / 2 + pointsCount * pointsCount / 2); // точка колебаний
+	const edgeLength = 2 / (pointsCount - 1);
+	const vertices = new Float32Array(pointsCount * pointsCount * vertexStructSize);
+	for(let i = 0; i < pointsCount; ++i) {
+		for(let j = 0; j < pointsCount; ++j) {
+			let index = (i + pointsCount * j) * vertexStructSize;
+			
+			// по краям делаем в 2 раза легче
+			let weightFactor = 1;
+			if (i == 0 || i == (pointsCount - 1))
+				weightFactor *= 2;
+			if (j == 0 || j == (pointsCount - 1))
+				weightFactor *= 2;
+			// по углам бесконечно тяжёлые, то есть неподвижные
+			if (weightFactor == 4)
+				weightFactor = 0;
+			// подвижная точка не двигается силой
+			if (index == movePointIndex * vertexStructSize)
+				weightFactor = 0;
+
+			// pos
+			vertices[index + 0] = -1 + 2 / (pointsCount - 1) * i; // x
+			vertices[index + 1] = -1 + 2 / (pointsCount - 1) * j; // y
+			vertices[index + 2] = 0; // z
+			vertices[index + 3] = 0; // * выравнивание
+
+			// prevPos(4, 5, 6, *7) считается в шейдере
+
+			// shift(8, 9, 10) в шейдере
+			
+			// rWeight
+			vertices[index + 11] = rWeight * weightFactor; // w
+
+			// vel
+			vertices[index + 12] = 0;
+			vertices[index + 13] = 0; //
+			vertices[index + 14] = 0; //
+			vertices[index + 15] = 0; // * выравнивание
+
+			// color
+			vertices[index + 16] = 0.4 + (i % 2) * 0.4; // r
+			vertices[index + 17] = 0.4 + (j % 2) * 0.4; // g
+			vertices[index + 18] = 0.5; // b
+			vertices[index + 19] = 1; // a
+		}
+	}
+
+	let indicesCount = 6 * (pointsCount - 1) * (pointsCount - 1);
+	const indices = new Uint32Array(indicesCount);
+	for(let i = 1; i < pointsCount; ++i) {
+		for(let j = 1; j < pointsCount; ++j) {
+			let index = (i - 1 + pointsCount * (j - 1));
+			let index2 = (i - 1 + (pointsCount - 1) * (j - 1)) * 6;
+			indices[index2 + 0] = index;
+			indices[index2 + 1] = index + 1;
+			indices[index2 + 2] = index + pointsCount;
+			indices[index2 + 3] = index + pointsCount;
+			indices[index2 + 4] = index + 1;
+			indices[index2 + 5] = index + 1 + pointsCount;
+		}
+	}
+
+	let lineIndicesCount = indicesCount * 2;
+	const lineIndices = new Uint32Array(lineIndicesCount);
+	for(let i = 0; i < indicesCount; i += 3) {
+		let index = i * 2;
+		lineIndices[index + 0] = indices[i];
+		lineIndices[index + 1] = indices[i + 1];
+		lineIndices[index + 2] = indices[i + 1];
+		lineIndices[index + 3] = indices[i + 2];
+		lineIndices[index + 4] = indices[i + 2];
+		lineIndices[index + 5] = indices[i];
+	}
+
+	// переносим в вершинный буфер
+	const vertexBuffer = device.createBuffer({
+		size: vertices.byteLength,
+		usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+		mappedAtCreation: true,
+	});
+	new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+	vertexBuffer.unmap();
+
+	// переносим в индексный буфер
+	const indexBuffer = device.createBuffer({
+		size: indices.byteLength,
+		usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+		mappedAtCreation: true,
+	});
+	new Uint32Array(indexBuffer.getMappedRange()).set(indices);
+	indexBuffer.unmap();
+
+	// переносим в индексный буфер
+	const lineIndexBuffer = device.createBuffer({
+		size: lineIndices.byteLength,
+		usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+		mappedAtCreation: true,
+	});
+	new Uint32Array(lineIndexBuffer.getMappedRange()).set(indices);
+	lineIndexBuffer.unmap();
+
+	// константы для шейдера
+	const simParamBuffer = device.createBuffer({
+		size: 6 * 4,
+		usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+	});
+
+	let time = 0;
+
+	function updateSimParams(dt) {
+		let freq = 0.1 * Math.PI * 2;
+		time = time + dt * freq;
+		if (time > Math.PI * 2){
+			time -= Math.PI * 2; // убираем лишнее на случай долгого времени симуляции
+		}
+		
+		let gravity = document.getElementById("gravity").checked ? 9.8 : 0;
+
+		device.queue.writeBuffer(
+			simParamBuffer,
+			0,
+			new Float32Array([
+				time,
+				dt,
+				pointsCount,
+				movePointIndex,
+				gravity,
+				edgeLength,
+			])
+		);
+	}
+
+	// ============================================
+	// шейдер для вычисления новой позиции вершин
+	// ============================================
+
+	const shaderCompute = device.createShaderModule({
+		code: `
+struct SimParams {
+	time : f32,
+	timeDelta : f32,
+	pointsCount: f32,
+	movePoint: f32,
+	gravity : f32,
+	length: f32,
+}
+
+struct Vertex {
+	pos : vec3f,
+	prevPos : vec3f,
+	shift : vec3f,
+	rweight : f32,
+	vel : vec3f,
+	color : vec4f,
+}
+
+@group(0) @binding(0) var<uniform> params : SimParams;
+@group(0) @binding(1) var<storage, read_write> vertices : array<Vertex>;
+
+
+// сила растяжения соседних точек
+fn get_strain_force(pointIndex: u32, otherIndex: u32) -> vec3f {
+	let point = &vertices[pointIndex];
+	let other = &vertices[otherIndex];
+	
+	let diff = other.pos - point.pos; // направление силы
+	let len = length(diff);
+	let delta = len - params.length; // абсолютное удлинение
+	if (delta <= 0) {
+		return vec3f(0);
+	}
+	
+	let strain = delta / len; // относительное удлинение
+	// закон Гука
+	let stress = strain * params.length * 200;
+	//point.color.r = strain;
+	return stress / len * diff; // нормируем diff
+}
+
+// ================================
+// двигаем не закреплённые вершины
+@compute @workgroup_size(2,2)
+fn free_main(@builtin(global_invocation_id) gid : vec3u) {
+	var index = gid.x + u32(params.pointsCount) * gid.y;
+
+	let v = &vertices[index];
+
+	if (v.rweight == 0) {
+		if (index == u32(params.movePoint)) {
+			// одну вершину перемещаем вручную
+			v.pos.z = 0.3 * sin(params.time);
+		}
+		return;
+	}
+	
+	// сила растяжения
+	var force = vec3f(0);
+	
+	if (gid.x > 0) {
+		let index2 = (gid.x - 1 + u32(params.pointsCount) * gid.y);
+		force += get_strain_force(index, index2);
+	}
+	
+	if (gid.x < u32(params.pointsCount) - 1) {
+		let index2 = (gid.x + 1 + u32(params.pointsCount) * gid.y);
+		force += get_strain_force(index, index2);
+	}
+	
+	if (gid.y > 0) {
+		let index2 = (gid.x + u32(params.pointsCount) * (gid.y - 1));
+		force += get_strain_force(index, index2);
+	}
+	
+	if (gid.y < u32(params.pointsCount) - 1) {
+		let index2 = (gid.x + u32(params.pointsCount) * (gid.y + 1));
+		force += get_strain_force(index, index2);
+	}
+	
+	v.vel += force * (v.rweight * params.timeDelta);
+	
+	// гравитация
+	v.vel.z -= params.gravity * params.timeDelta;
+	
+	// сопротивление воздуха
+	// f=p/t, p=m*v, m=rho*V, V=t*v*S
+	// f=rho*v^2*S
+	let rho = 1.3;
+	let S = params.length * params.length;
+	
+	var airFrictionFraction = 1.2 * length(v.vel) * rho * v.rweight * S * params.timeDelta;
+	airFrictionFraction = clamp(airFrictionFraction, 0, 1);
+	v.vel *= (1 - airFrictionFraction);
+	v.prevPos = v.pos;
+	v.pos += v.vel * params.timeDelta;
+	
+	//v.color.g = 0;
+	//v.color.g = length(v.vel);
+	//v.color.g = length(force) * 100;
+}
+
+
+// ограничение на длину
+// насколько должна сместиться точка для компенсации ошибки
+fn get_constrain_offset(pointIndex: u32, otherIndex: u32) -> vec3f {
+	let point = &vertices[pointIndex];
+	let other = &vertices[otherIndex];
+	
+	let diff = other.pos - point.pos; // направление компенсации ошибки
+	let len = length(diff);
+	let delta = len - params.length; // размер ошибки
+	if (delta <= 0) {
+		return vec3f(0);
+	}
+	let weight = point.rweight / (point.rweight + other.rweight);
+	return weight * delta / len * diff;
+}
+
+// ================================
+// чиним поломанные ограничения
+@compute @workgroup_size(2, 2)
+fn constrain_main(@builtin(global_invocation_id) gid : vec3u) {
+	var index = gid.x + u32(params.pointsCount) * gid.y;
+
+	let v = &vertices[index];
+
+	if (v.rweight == 0) {
+		return;
+	}
+	
+	var shift = vec3f(0);
+	var count = 0.0;
+	
+	// рассчитываем смещения в сторону соседних вершин
+	if (gid.x > 0) {
+		let index2 = (gid.x - 1 + u32(params.pointsCount) * gid.y);
+		shift += get_constrain_offset(index, index2);
+		count += 1;
+	}
+	
+	if (gid.x < u32(params.pointsCount) - 1) {
+		let index2 = (gid.x + 1 + u32(params.pointsCount) * gid.y);
+		shift += get_constrain_offset(index, index2);
+		count += 1;
+	}
+	
+	if (gid.y > 0) {
+		let index2 = (gid.x + u32(params.pointsCount) * (gid.y - 1));
+		shift += get_constrain_offset(index, index2);
+		count += 1;
+	}
+	
+	if (gid.y < u32(params.pointsCount) - 1) {
+		let index2 = (gid.x + u32(params.pointsCount) * (gid.y + 1));
+		shift += get_constrain_offset(index, index2);
+		count += 1;
+	}
+	
+	
+	v.shift = shift * (1 / count);
+}
+
+// ================================
+// двигаем вершины
+@compute @workgroup_size(2, 2)
+fn shift_main(@builtin(global_invocation_id) gid : vec3u) {
+	var index = gid.x + u32(params.pointsCount) * gid.y;
+	
+	let v = &vertices[index];
+	
+	let stiffnes = 0.7;
+	v.pos = v.pos + v.shift * stiffnes;
+	v.vel = v.pos - v.prevPos;
+}
+		`,
+	});
+
+
+	// ==================================
+	// настройки для вычислений
+	// ==================================
+
+	const computeBindGroupLayout = device.createBindGroupLayout({
+		entries: [
+			{
+				binding: 0,
+				visibility: GPUShaderStage.COMPUTE,
+				buffer: {
+					type: "uniform"
+				}
+			},
+			{
+				binding: 1,
+				visibility: GPUShaderStage.COMPUTE,
+				buffer: {
+					type: "storage"
+				}
+			}
+		]
+	});
+	
+	const computeFreePipeline = device.createComputePipeline({
+		layout: device.createPipelineLayout({
+			bindGroupLayouts: [computeBindGroupLayout]
+		}),
+		compute: {
+			module: shaderCompute,
+			entryPoint: "free_main",
+		},
+	});
+
+	const computeConstraintsPipeline = device.createComputePipeline({
+		layout: device.createPipelineLayout({
+			bindGroupLayouts: [computeBindGroupLayout]
+		}),
+		compute: {
+			module: shaderCompute,
+			entryPoint: "constrain_main",
+		},
+	});
+
+	const computeShiftPipeline = device.createComputePipeline({
+		layout: device.createPipelineLayout({
+			bindGroupLayouts: [computeBindGroupLayout]
+		}),
+		compute: {
+			module: shaderCompute,
+			entryPoint: "shift_main",
+		},
+	});
+
+	const computeBindGroup = device.createBindGroup({
+		layout: computeBindGroupLayout,
+		entries: [
+			{
+				binding: 0,
+				resource: simParamBuffer,
+			},
+			{
+				binding: 1,
+				resource: vertexBuffer,
+			}
+		]
+	});
+
+	const vertexBuffersDescriptors = [
+		{
+			attributes: [
+				{
+					shaderLocation: 0,
+					offset: 0,
+					format: "float32x3",
+				},
+				{
+					shaderLocation: 1,
+					offset: 64,
+					format: "float32x4",
+				},
+			],
+			arrayStride: vertexStructSize * 4,
+			stepMode: "vertex",
+		},
+	];
+
+
+	// ==================================
+	// обычные шейдеры, просто интерполируют цвета в треугольниках
+	// ==================================
+
+	const shaderDraw = device.createShaderModule({
+		code: `
+@binding(0) @group(0) var<uniform> vpMatrix : mat4x4<f32>;
+
+struct VertexOut {
+	@builtin(position) position : vec4<f32>,
+	@location(0) color : vec4<f32>,
+};
+
+
+@vertex
+fn vertex_main(@location(0) position: vec3<f32>,
+		@location(1) color: vec4<f32>) -> VertexOut
+{
+	var output : VertexOut;
+	output.position = vpMatrix * vec4<f32>(position, 1);
+	output.color = color;
+	return output;
+} 
+
+
+@fragment
+fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
+{
+	return fragData.color;
+} 
+		`,
+	});
+
+
+	// ==================================
+	// настройки для отрисовки
+	// ==================================
+
+	const renderBindGroupLayout = device.createBindGroupLayout({
+		label: "renderBindGroupLayout",
+		entries: [
+			{
+				binding: 0,
+				visibility: GPUShaderStage.VERTEX,
+				buffer: {
+					type: "uniform"
+				}
+			}
+		]
+	});
+
+	// настройка конвейера отрисовки
+	const renderPipeline = device.createRenderPipeline({
+		vertex: {
+			module: shaderDraw,
+			entryPoint: "vertex_main",
+			buffers: vertexBuffersDescriptors,
+		},
+		fragment: {
+			module: shaderDraw,
+			entryPoint: "fragment_main",
+			targets: [
+				{
+					format: presentationFormat,
+				},
+			],
+		},
+		primitive: {
+			topology: "triangle-list",
+		},
+		layout: device.createPipelineLayout({
+			bindGroupLayouts: [renderBindGroupLayout]
+		}),
+		depthStencil: {
+			depthWriteEnabled: true,
+			depthCompare: 'less',
+			format: "depth24plus",
+		},
+	});
+
+
+	// отрисовка сетки треугольников
+	const renderWireframePipeline = device.createRenderPipeline({
+		label: 'renderWireframePipeline',
+		vertex: {
+			module: shaderDraw,
+			entryPoint: "vertex_main",
+			buffers: vertexBuffersDescriptors,
+		},
+		fragment: {
+			module: shaderDraw,
+			entryPoint: "fragment_main",
+			targets: [
+				{
+					format: presentationFormat,
+					blend:{
+						alpha: { srcFactor: 'one' },
+						color: { srcFactor: 'zero' }
+					}
+				},
+			],
+		},
+		primitive: {
+			topology: "line-list",
+			cullMode: "none",
+		},
+		layout: device.createPipelineLayout({
+			bindGroupLayouts: [renderBindGroupLayout]
+		}),
+		depthStencil: {
+			depthWriteEnabled: true,
+			depthCompare: 'less',
+			format: "depth24plus",
+		},
+	});
+
+	// матрица камеры
+	let vpMatrix = mat4.create();
+
+	const projectionMatrix = mat4.create();
+	let aspectRatio = canvas.width / canvas.height;
+	mat4.perspective(projectionMatrix, Math.PI / 4, aspectRatio, 0.1, 10.0);
+
+	const viewMatrix = mat4.create();
+	let cameraPos = vec3.fromValues(2, 2, 2);
+	let modelPos = vec3.fromValues(0, 0, 0);
+	let upVec = vec3.fromValues(0, 0, 1);
+	mat4.lookAt(viewMatrix, cameraPos, modelPos, upVec);
+
+	mat4.multiply(vpMatrix, projectionMatrix, viewMatrix);
+
+	const uniformBuffer = device.createBuffer({
+		size: vpMatrix.byteLength,
+		usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+		mappedAtCreation: true,
+	});
+	new Float32Array(uniformBuffer.getMappedRange()).set(vpMatrix);
+	uniformBuffer.unmap();
+
+	const uniformBindGroup = device.createBindGroup({
+		label: "vpMatrix",
+		layout: renderBindGroupLayout,
+		entries: [{
+			binding: 0,
+			resource: uniformBuffer,
+		}]
+	});
+
+	// очистка фрейм буфера
+	const renderPassDescriptor = {
+		colorAttachments: [
+			{
+				clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+				loadOp: "clear",
+				storeOp: "store",
+			},
+		],
+		depthStencilAttachment: {
+			view: device.createTexture({
+				size: [canvas.width, canvas.height],
+				format: "depth24plus",
+				usage: GPUTextureUsage.RENDER_ATTACHMENT
+			}),
+			depthClearValue: 1.0,
+			depthLoadOp: "clear",
+			depthStoreOp: "store",
+		},
+	};
+
+	// отрисовка кадра
+	function frame() {
+		renderPassDescriptor.colorAttachments[0].view = context
+			.getCurrentTexture()
+			.createView(); // устанавливаем таргет для вывода
+		const commandEncoder = device.createCommandEncoder();
+
+		let subdivs = 10;
+		let dt = 0.03 / subdivs;
+		for (let i = 0; i < subdivs; ++i)
+		{
+			updateSimParams(dt);
+			// считаем новые позиции
+			{
+				const passEncoder = commandEncoder.beginComputePass();
+				passEncoder.setPipeline(computeFreePipeline);
+				passEncoder.setBindGroup(0, computeBindGroup);
+				passEncoder.dispatchWorkgroups(Math.ceil(pointsCount / 2), Math.ceil(pointsCount / 2));
+				passEncoder.end();
+			}
+
+			// считаем смещения для коррекции
+			{
+				const passEncoder = commandEncoder.beginComputePass();
+				passEncoder.setPipeline(computeConstraintsPipeline);
+				passEncoder.setBindGroup(0, computeBindGroup);
+				passEncoder.dispatchWorkgroups(Math.ceil(pointsCount / 2), Math.ceil(pointsCount / 2));
+				passEncoder.end();
+			}
+
+			// корректируем
+			{
+				const passEncoder = commandEncoder.beginComputePass();
+				passEncoder.setPipeline(computeShiftPipeline);
+				passEncoder.setBindGroup(0, computeBindGroup);
+				passEncoder.dispatchWorkgroups(Math.ceil(pointsCount / 2), Math.ceil(pointsCount / 2));
+				passEncoder.end();
+			}
+		}
+
+		// рисуем
+		{
+			const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+			
+			// треугольники
+			passEncoder.setPipeline(renderPipeline);
+			passEncoder.setVertexBuffer(0, vertexBuffer);
+			passEncoder.setIndexBuffer(indexBuffer, "uint32");
+			passEncoder.setBindGroup(0, uniformBindGroup);
+			passEncoder.drawIndexed(indicesCount);
+
+			// сетка
+			passEncoder.setPipeline(renderWireframePipeline);
+			passEncoder.setBindGroup(0, uniformBindGroup);
+			passEncoder.setVertexBuffer(0, vertexBuffer);
+			passEncoder.setIndexBuffer(lineIndexBuffer, "uint32");
+			passEncoder.drawIndexed(lineIndicesCount);
+
+			passEncoder.end();
+		}
+
+		device.queue.submit([commandEncoder.finish()]);
+		requestAnimationFrame(frame);
+	}
+
+	requestAnimationFrame(frame);
+};
+
+init();
+    </script>
+  </body>
+</html>
